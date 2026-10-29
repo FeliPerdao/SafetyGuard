@@ -2,30 +2,42 @@ import os
 import sys
 import time
 import ctypes
+import logging
+import logging.handlers
 import tkinter as tk
 
 import numpy as np
 import pyautogui
 
 # ------------------------------------------------------------
-# Windows: evita que el escalado de pantalla (DPI) desfase los clicks
+# Windows: evita que el escalado de pantalla (DPI) desfase los clicks.
+# Debe ejecutarse ANTES de crear la ventana de Tk.
 # ------------------------------------------------------------
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Windows 8.1 o superior
 except Exception:
-    pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()    # Windows 7
+    except Exception:
+        pass
 
 pyautogui.FAILSAFE = False  # la máquina no tiene mouse físico, no hace falta
 
 # ------------------------------------------------------------
 # CONFIGURACIÓN
 # ------------------------------------------------------------
-CARPETA = os.path.dirname(os.path.abspath(sys.argv[0]))
+# Carpeta del programa (funciona tanto con .py como con el .exe de PyInstaller)
+if getattr(sys, "frozen", False):
+    CARPETA = os.path.dirname(sys.executable)
+else:
+    CARPETA = os.path.dirname(os.path.abspath(__file__))
+
 IMG_START = os.path.join(CARPETA, "start.jpg")
 IMG_STOP = os.path.join(CARPETA, "stop.jpg")
+ARCHIVO_LOG = os.path.join(CARPETA, "safetyguard.log")
 
 ESPERA_CLICK_MS = 1000          # 1 segundo antes de clickear start / antes de volver a pedir usuario
-TIEMPO_INACTIVIDAD = 5 #* 60     # 5 minutos sin cambios en pantalla (segundos)
+TIEMPO_INACTIVIDAD = 5 * 60     # 5 minutos sin cambios en pantalla (segundos)
 INTERVALO_REVISION_MS = 2000    # cada cuánto se compara la pantalla
 ESPERA_BASE_MS = 3000           # tras clickear start, esperar antes de tomar la imagen base
 
@@ -41,12 +53,42 @@ UMBRAL_CAMBIO = 0.0005          # fracción de píxeles que deben cambiar (0.05%
 
 
 # ------------------------------------------------------------
+# Log a archivo (con --noconsole no hay dónde ver los print)
+# ------------------------------------------------------------
+log = logging.getLogger("safetyguard")
+log.setLevel(logging.INFO)
+try:
+    _handler = logging.handlers.RotatingFileHandler(
+        ARCHIVO_LOG, maxBytes=200000, backupCount=2, encoding="utf-8"
+    )
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(_handler)
+except Exception:
+    log.addHandler(logging.NullHandler())
+
+
+# ------------------------------------------------------------
+# Instancia única (evita dos ventanas de bloqueo a la vez)
+# ------------------------------------------------------------
+try:
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _mutex = _kernel32.CreateMutexW(None, False, "SafetyGuard_Mutex")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        log.warning("Ya hay otra instancia en ejecución. Saliendo.")
+        sys.exit(0)
+except SystemExit:
+    raise
+except Exception:
+    pass
+
+
+# ------------------------------------------------------------
 # Estado
 # ------------------------------------------------------------
 estado = {
     "monitoreando": False,
     "frame_anterior": None,
-    "ultimo_cambio": time.time(),
+    "ultimo_cambio": time.monotonic(),
 }
 
 
@@ -55,9 +97,12 @@ estado = {
 # ------------------------------------------------------------
 def clickear_boton(ruta_imagen):
     """Busca la imagen en pantalla y hace click. Devuelve True si lo encontró."""
+    nombre = os.path.basename(ruta_imagen)
+
     if not os.path.exists(ruta_imagen):
-        print(f"[AVISO] No existe el archivo: {ruta_imagen}")
+        log.warning("No existe el archivo: %s", ruta_imagen)
         return False
+
     try:
         try:
             pos = pyautogui.locateCenterOnScreen(ruta_imagen, confidence=CONFIANZA_BOTON)
@@ -69,12 +114,20 @@ def clickear_boton(ruta_imagen):
         pos = None
 
     if pos is None:
-        print(f"[INFO] Botón no encontrado: {os.path.basename(ruta_imagen)}")
+        log.info("Botón no encontrado: %s", nombre)
         return False
 
-    pyautogui.click(pos.x, pos.y)
-    print(f"[OK] Click en {os.path.basename(ruta_imagen)} ({pos.x}, {pos.y})")
-    return True
+    try:
+        # Mover primero y esperar un instante: algunas páginas web
+        # necesitan el "hover" antes de aceptar el click.
+        pyautogui.moveTo(pos.x, pos.y, duration=0.3)
+        time.sleep(0.2)
+        pyautogui.click()
+        log.info("Click en %s (%s, %s)", nombre, pos.x, pos.y)
+        return True
+    except Exception:
+        log.exception("Error al hacer click en %s", nombre)
+        return False
 
 
 # ------------------------------------------------------------
@@ -101,21 +154,24 @@ def revisar_pantalla():
     try:
         frame = capturar_frame()
         if estado["frame_anterior"] is not None and hay_cambio(estado["frame_anterior"], frame):
-            estado["ultimo_cambio"] = time.time()
+            estado["ultimo_cambio"] = time.monotonic()
         estado["frame_anterior"] = frame
-    except Exception as e:
-        print(f"[ERROR] Captura de pantalla: {e}")
+    except Exception:
+        log.exception("Error al capturar la pantalla")
 
-    if time.time() - estado["ultimo_cambio"] >= TIEMPO_INACTIVIDAD:
+    if time.monotonic() - estado["ultimo_cambio"] >= TIEMPO_INACTIVIDAD:
         iniciar_bloqueo()
     else:
         root.after(INTERVALO_REVISION_MS, revisar_pantalla)
 
 
 def iniciar_monitoreo():
+    if estado["monitoreando"]:
+        return  # evita arrancar dos ciclos de revisión
     estado["frame_anterior"] = None
-    estado["ultimo_cambio"] = time.time()
+    estado["ultimo_cambio"] = time.monotonic()
     estado["monitoreando"] = True
+    log.info("Monitoreo de pantalla iniciado")
     root.after(INTERVALO_REVISION_MS, revisar_pantalla)
 
 
@@ -125,8 +181,12 @@ def iniciar_monitoreo():
 def iniciar_bloqueo():
     """Inactividad detectada: click en STOP y, 1 s después, pedir usuario."""
     estado["monitoreando"] = False
-    clickear_boton(IMG_STOP)
-    root.after(ESPERA_CLICK_MS, mostrar_bloqueo)
+    log.info("Inactividad detectada: bloqueando")
+    try:
+        clickear_boton(IMG_STOP)
+    finally:
+        # Pase lo que pase con el click, siempre se vuelve a bloquear
+        root.after(ESPERA_CLICK_MS, mostrar_bloqueo)
 
 
 def mostrar_bloqueo():
@@ -147,7 +207,7 @@ def validar():
     if not usuario:
         return
 
-    print(f"[LOGIN] Usuario: {usuario}")
+    log.info("Login: %s", usuario)
     root.withdraw()
     root.after(ESPERA_CLICK_MS, despues_de_desbloquear)
 
@@ -167,6 +227,13 @@ root.attributes("-fullscreen", True)
 root.attributes("-topmost", True)
 root.configure(bg="black")
 root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+
+def _error_tk(exc, val, tb):
+    log.error("Error no controlado", exc_info=(exc, val, tb))
+
+
+root.report_callback_exception = _error_tk
 
 frame = tk.Frame(root, bg="black")
 frame.place(relx=0.5, rely=0.5, anchor="center")
@@ -191,5 +258,6 @@ tk.Button(
 
 root.bind("<Return>", lambda event: validar())
 
+log.info("SafetyGuard iniciado")
 entry_usuario.focus_set()
 root.mainloop()
